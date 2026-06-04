@@ -1,7 +1,6 @@
 name: Wix Static Site Scraper
 
 on:
-  # Run manually from the Actions tab
   workflow_dispatch:
     inputs:
       site_url:
@@ -19,9 +18,13 @@ on:
         default: "2000"
         type: string
 
-  # Optional: run on a schedule (e.g. weekly backup)
   # schedule:
   #   - cron: '0 3 * * 0'   # Every Sunday at 03:00 UTC
+
+permissions:
+  pages: write
+  id-token: write
+  contents: read
 
 jobs:
   scrape:
@@ -39,7 +42,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
 
       # ── 3. Install system dependencies for Puppeteer / Chrome ─────────────
       - name: Install Chrome dependencies
@@ -56,7 +58,7 @@ jobs:
 
       # ── 4. Install npm packages ────────────────────────────────────────────
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       # ── 5. Run the crawler ────────────────────────────────────────────────
       - name: Crawl site
@@ -70,7 +72,7 @@ jobs:
       # ── 6. Show summary ───────────────────────────────────────────────────
       - name: Print output summary
         run: |
-          echo "## 📁 Scraped files" >> $GITHUB_STEP_SUMMARY
+          echo "## Scraped files" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           find ./static-output -type f | head -100 >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -84,25 +86,21 @@ jobs:
           path: ./static-output/
           retention-days: 30
 
-      # ── 8. (Optional) Deploy to GitHub Pages ─────────────────────────────
-      # Uncomment the block below to auto-deploy to GitHub Pages after scraping.
-      # Make sure Pages is enabled in repo Settings → Pages → Source: GitHub Actions
-      #
-      # - name: Upload to GitHub Pages
-      #   uses: actions/upload-pages-artifact@v3
-      #   with:
-      #     path: ./static-output/
-      #
-      # deploy-pages:
-      #   needs: scrape
-      #   permissions:
-      #     pages: write
-      #     id-token: write
-      #   environment:
-      #     name: github-pages
-      #     url: ${{ steps.deployment.outputs.page_url }}
-      #   runs-on: ubuntu-latest
-      #   steps:
-      #     - name: Deploy to GitHub Pages
-      #       id: deployment
-      #       uses: actions/deploy-pages@v4
+      # ── 8. Upload to GitHub Pages ─────────────────────────────────────────
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./static-output/
+
+  # ── 9. Deploy to GitHub Pages ─────────────────────────────────────────────
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    needs: scrape
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
