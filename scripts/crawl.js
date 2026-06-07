@@ -5,7 +5,7 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
-const BASE_URL = process.env.SITE_URL;
+const BASE_URL = process.env.SITE_URL.replace(/\/$/, ''); // e.g. https://user.wixsite.com/mysite
 const OUTPUT_DIR = process.env.OUTPUT_DIR || './output';
 const MAX_PAGES = parseInt(process.env.MAX_PAGES || '200');
 const WAIT_MS = parseInt(process.env.WAIT_MS || '2000');
@@ -15,17 +15,46 @@ if (!BASE_URL) {
   process.exit(1);
 }
 
-const baseOrigin = new URL(BASE_URL).origin;
+const baseUrl = new URL(BASE_URL);
+const baseOrigin = baseUrl.origin;
+const basePath = baseUrl.pathname; // e.g. /saritsilverman
+
 const visited = new Set();
 const queue = [BASE_URL];
 let pageCount = 0;
 
-function sanitizePath(urlStr) {
+// Convert a URL to a local file path, stripping the basePath prefix
+// so output/index.html is the root, not output/saritsilverman/index.html
+function urlToFilePath(urlStr) {
   const u = new URL(urlStr);
+  // Strip the site base path so root page → index.html
   let p = u.pathname;
-  if (p.endsWith('/') || p === '') p += 'index.html';
-  else if (!path.extname(p)) p += '/index.html';
+  if (p.startsWith(basePath)) {
+    p = p.slice(basePath.length) || '/';
+  }
+  if (p === '/' || p === '') p = '/index.html';
+  else if (!path.extname(p)) p = p.replace(/\/$/, '') + '/index.html';
   return path.join(OUTPUT_DIR, p);
+}
+
+// Convert a URL to the relative href that should appear in HTML
+// from the perspective of a page at fromPathname
+function urlToRelativeHref(targetUrl, fromPathname) {
+  const u = new URL(targetUrl);
+  let targetPath = u.pathname;
+
+  // Strip basePath prefix from both
+  if (targetPath.startsWith(basePath)) targetPath = targetPath.slice(basePath.length) || '/';
+  if (fromPathname.startsWith(basePath)) fromPathname = fromPathname.slice(basePath.length) || '/';
+
+  // Normalize to file paths
+  if (targetPath === '/' || targetPath === '') targetPath = '/index.html';
+  else if (!path.extname(targetPath)) targetPath = targetPath.replace(/\/$/, '') + '/index.html';
+
+  const fromDir = path.dirname(fromPathname === '/' ? '/index.html' : fromPathname);
+  let rel = path.relative(fromDir, targetPath);
+  if (!rel.startsWith('.')) rel = './' + rel;
+  return rel;
 }
 
 function ensureDir(filePath) {
@@ -51,18 +80,14 @@ function downloadFile(fileUrl, destPath) {
 }
 
 function rewriteHtml(html, pageUrl) {
-  // Rewrite absolute URLs to relative paths so the static site works offline
-  const pageBase = new URL(pageUrl);
-
+  const fromPathname = new URL(pageUrl).pathname;
   return html.replace(
     /(href|src|action)="(https?:\/\/[^"]+)"/g,
     (match, attr, url) => {
       try {
         const u = new URL(url);
-        if (u.origin === baseOrigin) {
-          let rel = path.relative(path.dirname(pageBase.pathname), u.pathname);
-          if (!rel) rel = './index.html';
-          if (!path.extname(rel)) rel = rel + '/index.html';
+        if (u.origin === baseOrigin && u.pathname.startsWith(basePath)) {
+          const rel = urlToRelativeHref(url, fromPathname);
           return `${attr}="${rel}"`;
         }
       } catch {}
@@ -71,14 +96,13 @@ function rewriteHtml(html, pageUrl) {
   );
 }
 
-async function extractAssets(page, pageUrl) {
+async function extractAssets(page) {
   return page.evaluate(() => {
     const assets = [];
     document.querySelectorAll('img[src], script[src], link[href]').forEach(el => {
       const url = el.src || el.href;
       if (url && url.startsWith('http')) assets.push(url);
     });
-    // Also grab CSS background-image urls
     document.querySelectorAll('[style]').forEach(el => {
       const m = el.style.backgroundImage.match(/url\(["']?(https?:\/\/[^"')]+)/);
       if (m) assets.push(m[1]);
@@ -97,7 +121,7 @@ async function extractLinks(page) {
 
 async function crawl() {
   console.log(`🚀 Starting crawl of ${BASE_URL}`);
-  console.log(`📁 Output: ${OUTPUT_DIR}  |  Max pages: ${MAX_PAGES}\n`);
+  console.log(`📁 Output: ${OUTPUT_DIR}  |  Base path: ${basePath}  |  Max pages: ${MAX_PAGES}\n`);
 
   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
@@ -112,11 +136,9 @@ async function crawl() {
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
   await page.setViewport({ width: 1280, height: 900 });
 
-  // Intercept and block unnecessary heavy resources to speed up crawl
   await page.setRequestInterception(true);
   page.on('request', req => {
-    const type = req.resourceType();
-    if (['font', 'media'].includes(type)) req.abort();
+    if (['font', 'media'].includes(req.resourceType())) req.abort();
     else req.continue();
   });
 
@@ -125,16 +147,16 @@ async function crawl() {
     if (visited.has(url)) continue;
 
     const u = new URL(url);
-    if (u.origin !== baseOrigin) continue; // stay on same domain
+    // Only crawl pages under the base path
+    if (u.origin !== baseOrigin || !u.pathname.startsWith(basePath)) continue;
 
     visited.add(url);
     pageCount++;
-
     console.log(`[${pageCount}/${MAX_PAGES}] Crawling: ${url}`);
 
     try {
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-      await new Promise(r => setTimeout(r, WAIT_MS)); // extra wait for Wix JS
+      await new Promise(r => setTimeout(r, WAIT_MS));
 
       // Scroll to trigger lazy-loaded content
       await page.evaluate(async () => {
@@ -150,18 +172,18 @@ async function crawl() {
 
       const html = await page.content();
       const rewritten = rewriteHtml(html, url);
-      const filePath = sanitizePath(url);
+      const filePath = urlToFilePath(url);
       ensureDir(filePath);
       fs.writeFileSync(filePath, rewritten, 'utf8');
       console.log(`   ✅ Saved → ${filePath}`);
 
-      // Download static assets
-      const assets = await extractAssets(page, url);
+      // Download assets that are on the same origin
+      const assets = await extractAssets(page);
       for (const assetUrl of assets) {
         try {
           const au = new URL(assetUrl);
-          if (au.origin === baseOrigin && au.pathname !== '/') {
-            const destPath = path.join(OUTPUT_DIR, au.pathname);
+          if (au.origin === baseOrigin) {
+            const destPath = path.join(OUTPUT_DIR, au.pathname.replace(basePath, '') || au.pathname);
             await downloadFile(assetUrl, destPath);
           }
         } catch {}
@@ -172,8 +194,8 @@ async function crawl() {
       for (const link of links) {
         try {
           const lu = new URL(link);
-          const clean = lu.origin + lu.pathname; // strip query & hash
-          if (lu.origin === baseOrigin && !visited.has(clean)) {
+          const clean = lu.origin + lu.pathname;
+          if (lu.origin === baseOrigin && lu.pathname.startsWith(basePath) && !visited.has(clean)) {
             queue.push(clean);
           }
         } catch {}
@@ -186,7 +208,6 @@ async function crawl() {
 
   await browser.close();
 
-  // Write a simple sitemap
   const sitemap = [...visited].map(u => `<url><loc>${u}</loc></url>`).join('\n');
   fs.writeFileSync(
     path.join(OUTPUT_DIR, 'sitemap.xml'),
@@ -194,7 +215,7 @@ async function crawl() {
   );
 
   console.log(`\n✅ Done! ${pageCount} pages saved to ${OUTPUT_DIR}/`);
-  console.log(`📄 Sitemap written to ${OUTPUT_DIR}/sitemap.xml`);
+  console.log(`📄 Sitemap → ${OUTPUT_DIR}/sitemap.xml`);
 }
 
 crawl().catch(err => {
