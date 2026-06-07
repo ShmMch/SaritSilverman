@@ -23,45 +23,62 @@ const visited = new Set();
 const queue = [BASE_URL];
 let pageCount = 0;
 
-// Decode percent-encoded Hebrew/Unicode paths to real characters
-// so filenames on disk are readable and consistent
 function decodePath(p) {
   try { return decodeURIComponent(p); } catch { return p; }
 }
 
-// Convert a URL to a safe local file path
-function urlToFilePath(urlStr) {
-  const u = new URL(urlStr);
-  let p = decodePath(u.pathname);
-
-  // Strip the site base path (e.g. /saritsilverman) so root → index.html
-  if (p.startsWith(basePath)) p = p.slice(basePath.length) || '/';
-
-  if (p === '/' || p === '') p = '/index.html';
-  else if (!path.extname(p)) p = p.replace(/\/$/, '') + '/index.html';
-
-  // Replace characters that are unsafe on Windows/Linux filesystems
-  p = p.replace(/[?#]/g, '_');
-
-  return path.join(OUTPUT_DIR, p);
+// Strip basePath prefix and normalize to a clean URL path (not filesystem path)
+// e.g. /saritsilverman/בית  →  /בית
+function toSitePath(urlPathname) {
+  let p = decodePath(urlPathname);
+  if (p.startsWith(basePath)) p = p.slice(basePath.length);
+  if (!p || p === '/') return '/';
+  return p.startsWith('/') ? p : '/' + p;
 }
 
-// Build a relative href between two decoded paths
-function urlToRelativeHref(targetUrl, fromPathname) {
-  const u = new URL(targetUrl);
-  let targetPath = decodePath(u.pathname);
-  let fromPath = decodePath(fromPathname);
+// Convert site path to a local filename
+// /בית  →  /בית/index.html
+// /      →  /index.html
+function sitePathToFile(sitePath) {
+  if (sitePath === '/') return '/index.html';
+  if (!path.extname(sitePath)) return sitePath.replace(/\/$/, '') + '/index.html';
+  return sitePath;
+}
 
-  if (targetPath.startsWith(basePath)) targetPath = targetPath.slice(basePath.length) || '/';
-  if (fromPath.startsWith(basePath)) fromPath = fromPath.slice(basePath.length) || '/';
+// Build a relative href from one page to another — pure URL logic, no filesystem paths
+// fromSitePath: /צור-קשר     targetSitePath: /בית
+// result: ../בית/index.html
+function relativeHref(fromSitePath, targetSitePath) {
+  const fromFile = sitePathToFile(fromSitePath === '/' ? '/' : fromSitePath);
+  const targetFile = sitePathToFile(targetSitePath);
 
-  if (targetPath === '/' || targetPath === '') targetPath = '/index.html';
-  else if (!path.extname(targetPath)) targetPath = targetPath.replace(/\/$/, '') + '/index.html';
+  // Split into segments
+  const fromParts = fromFile.split('/').filter(Boolean);
+  const targetParts = targetFile.split('/').filter(Boolean);
 
-  const fromDir = path.dirname(fromPath === '/' ? '/index.html' : fromPath);
-  let rel = path.relative(fromDir, targetPath);
-  if (!rel.startsWith('.')) rel = './' + rel;
-  return rel;
+  // Remove filename from fromParts (we want the directory)
+  fromParts.pop();
+
+  // Find common prefix length
+  let common = 0;
+  while (common < fromParts.length && common < targetParts.length && fromParts[common] === targetParts[common]) {
+    common++;
+  }
+
+  const ups = fromParts.length - common;
+  const downs = targetParts.slice(common);
+
+  const rel = [...Array(ups).fill('..'), ...downs].join('/');
+  return rel || './index.html';
+}
+
+// Convert a full URL to a local output file path
+function urlToFilePath(urlStr) {
+  const u = new URL(urlStr);
+  const sitePath = toSitePath(u.pathname);
+  const filePart = sitePathToFile(sitePath);
+  const safe = filePart.replace(/[?#]/g, '_');
+  return path.join(OUTPUT_DIR, safe);
 }
 
 function ensureDir(filePath) {
@@ -87,14 +104,16 @@ function downloadFile(fileUrl, destPath) {
 }
 
 function rewriteHtml(html, pageUrl) {
-  const fromPathname = new URL(pageUrl).pathname;
+  const fromSitePath = toSitePath(new URL(pageUrl).pathname);
+
   return html.replace(
     /(href|src|action)="(https?:\/\/[^"]+)"/g,
     (match, attr, url) => {
       try {
         const u = new URL(url);
         if (u.origin === baseOrigin && u.pathname.startsWith(basePath)) {
-          const rel = urlToRelativeHref(url, fromPathname);
+          const targetSitePath = toSitePath(u.pathname);
+          const rel = relativeHref(fromSitePath, targetSitePath);
           return `${attr}="${rel}"`;
         }
       } catch {}
@@ -126,9 +145,16 @@ async function extractLinks(page) {
   );
 }
 
+function normalizeUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    return baseOrigin + decodePath(u.pathname);
+  } catch { return urlStr; }
+}
+
 async function crawl() {
   console.log(`🚀 Starting crawl of ${BASE_URL}`);
-  console.log(`📁 Output: ${OUTPUT_DIR}  |  Base path: ${basePath}  |  Max pages: ${MAX_PAGES}\n`);
+  console.log(`📁 Output: ${OUTPUT_DIR}  |  Base path: "${basePath}"  |  Max pages: ${MAX_PAGES}\n`);
 
   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
@@ -151,30 +177,23 @@ async function crawl() {
 
   while (queue.length > 0 && pageCount < MAX_PAGES) {
     const url = queue.shift();
-
-    // Normalize URL for dedup — decode Hebrew so %D7%91%D7%99%D7%AA and בית are the same
-    const normalizedUrl = (() => {
-      try {
-        const u = new URL(url);
-        return baseOrigin + decodePath(u.pathname);
-      } catch { return url; }
-    })();
-
-    if (visited.has(normalizedUrl)) continue;
+    const normalized = normalizeUrl(url);
+    if (visited.has(normalized)) continue;
 
     const u = new URL(url);
     if (u.origin !== baseOrigin || !u.pathname.startsWith(basePath)) continue;
 
-    visited.add(normalizedUrl);
+    visited.add(normalized);
     pageCount++;
-    console.log(`[${pageCount}/${MAX_PAGES}] Crawling: ${url}`);
-    console.log(`   Decoded path: ${decodePath(u.pathname)}`);
+
+    const sitePath = toSitePath(u.pathname);
+    console.log(`[${pageCount}/${MAX_PAGES}] ${url}`);
+    console.log(`   sitePath: "${sitePath}"`);
 
     try {
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
       await new Promise(r => setTimeout(r, WAIT_MS));
 
-      // Scroll to trigger lazy-loaded content
       await page.evaluate(async () => {
         await new Promise(resolve => {
           let total = 0;
@@ -191,15 +210,15 @@ async function crawl() {
       const filePath = urlToFilePath(url);
       ensureDir(filePath);
       fs.writeFileSync(filePath, rewritten, 'utf8');
-      console.log(`   ✅ Saved → ${filePath}`);
+      console.log(`   ✅ → ${filePath}`);
 
       const assets = await extractAssets(page);
       for (const assetUrl of assets) {
         try {
           const au = new URL(assetUrl);
           if (au.origin === baseOrigin) {
-            const decodedAssetPath = decodePath(au.pathname).replace(basePath, '') || au.pathname;
-            const destPath = path.join(OUTPUT_DIR, decodedAssetPath);
+            const assetSitePath = toSitePath(au.pathname);
+            const destPath = path.join(OUTPUT_DIR, assetSitePath);
             await downloadFile(assetUrl, destPath);
           }
         } catch {}
@@ -210,8 +229,8 @@ async function crawl() {
         try {
           const lu = new URL(link);
           if (lu.origin === baseOrigin && lu.pathname.startsWith(basePath)) {
-            const normalizedLink = baseOrigin + decodePath(lu.pathname);
-            if (!visited.has(normalizedLink)) queue.push(link);
+            const normLink = normalizeUrl(link);
+            if (!visited.has(normLink)) queue.push(link);
           }
         } catch {}
       }
@@ -230,7 +249,6 @@ async function crawl() {
   );
 
   console.log(`\n✅ Done! ${pageCount} pages saved to ${OUTPUT_DIR}/`);
-  console.log(`📄 Sitemap → ${OUTPUT_DIR}/sitemap.xml`);
 }
 
 crawl().catch(err => {
