@@ -5,7 +5,7 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
-const BASE_URL = process.env.SITE_URL.replace(/\/$/, ''); // e.g. https://user.wixsite.com/mysite
+const BASE_URL = process.env.SITE_URL.replace(/\/$/, '');
 const OUTPUT_DIR = process.env.OUTPUT_DIR || './output';
 const MAX_PAGES = parseInt(process.env.MAX_PAGES || '200');
 const WAIT_MS = parseInt(process.env.WAIT_MS || '2000');
@@ -23,35 +23,42 @@ const visited = new Set();
 const queue = [BASE_URL];
 let pageCount = 0;
 
-// Convert a URL to a local file path, stripping the basePath prefix
-// so output/index.html is the root, not output/saritsilverman/index.html
+// Decode percent-encoded Hebrew/Unicode paths to real characters
+// so filenames on disk are readable and consistent
+function decodePath(p) {
+  try { return decodeURIComponent(p); } catch { return p; }
+}
+
+// Convert a URL to a safe local file path
 function urlToFilePath(urlStr) {
   const u = new URL(urlStr);
-  // Strip the site base path so root page → index.html
-  let p = u.pathname;
-  if (p.startsWith(basePath)) {
-    p = p.slice(basePath.length) || '/';
-  }
+  let p = decodePath(u.pathname);
+
+  // Strip the site base path (e.g. /saritsilverman) so root → index.html
+  if (p.startsWith(basePath)) p = p.slice(basePath.length) || '/';
+
   if (p === '/' || p === '') p = '/index.html';
   else if (!path.extname(p)) p = p.replace(/\/$/, '') + '/index.html';
+
+  // Replace characters that are unsafe on Windows/Linux filesystems
+  p = p.replace(/[?#]/g, '_');
+
   return path.join(OUTPUT_DIR, p);
 }
 
-// Convert a URL to the relative href that should appear in HTML
-// from the perspective of a page at fromPathname
+// Build a relative href between two decoded paths
 function urlToRelativeHref(targetUrl, fromPathname) {
   const u = new URL(targetUrl);
-  let targetPath = u.pathname;
+  let targetPath = decodePath(u.pathname);
+  let fromPath = decodePath(fromPathname);
 
-  // Strip basePath prefix from both
   if (targetPath.startsWith(basePath)) targetPath = targetPath.slice(basePath.length) || '/';
-  if (fromPathname.startsWith(basePath)) fromPathname = fromPathname.slice(basePath.length) || '/';
+  if (fromPath.startsWith(basePath)) fromPath = fromPath.slice(basePath.length) || '/';
 
-  // Normalize to file paths
   if (targetPath === '/' || targetPath === '') targetPath = '/index.html';
   else if (!path.extname(targetPath)) targetPath = targetPath.replace(/\/$/, '') + '/index.html';
 
-  const fromDir = path.dirname(fromPathname === '/' ? '/index.html' : fromPathname);
+  const fromDir = path.dirname(fromPath === '/' ? '/index.html' : fromPath);
   let rel = path.relative(fromDir, targetPath);
   if (!rel.startsWith('.')) rel = './' + rel;
   return rel;
@@ -144,15 +151,24 @@ async function crawl() {
 
   while (queue.length > 0 && pageCount < MAX_PAGES) {
     const url = queue.shift();
-    if (visited.has(url)) continue;
+
+    // Normalize URL for dedup — decode Hebrew so %D7%91%D7%99%D7%AA and בית are the same
+    const normalizedUrl = (() => {
+      try {
+        const u = new URL(url);
+        return baseOrigin + decodePath(u.pathname);
+      } catch { return url; }
+    })();
+
+    if (visited.has(normalizedUrl)) continue;
 
     const u = new URL(url);
-    // Only crawl pages under the base path
     if (u.origin !== baseOrigin || !u.pathname.startsWith(basePath)) continue;
 
-    visited.add(url);
+    visited.add(normalizedUrl);
     pageCount++;
     console.log(`[${pageCount}/${MAX_PAGES}] Crawling: ${url}`);
+    console.log(`   Decoded path: ${decodePath(u.pathname)}`);
 
     try {
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
@@ -177,26 +193,25 @@ async function crawl() {
       fs.writeFileSync(filePath, rewritten, 'utf8');
       console.log(`   ✅ Saved → ${filePath}`);
 
-      // Download assets that are on the same origin
       const assets = await extractAssets(page);
       for (const assetUrl of assets) {
         try {
           const au = new URL(assetUrl);
           if (au.origin === baseOrigin) {
-            const destPath = path.join(OUTPUT_DIR, au.pathname.replace(basePath, '') || au.pathname);
+            const decodedAssetPath = decodePath(au.pathname).replace(basePath, '') || au.pathname;
+            const destPath = path.join(OUTPUT_DIR, decodedAssetPath);
             await downloadFile(assetUrl, destPath);
           }
         } catch {}
       }
 
-      // Enqueue new internal links
       const links = await extractLinks(page);
       for (const link of links) {
         try {
           const lu = new URL(link);
-          const clean = lu.origin + lu.pathname;
-          if (lu.origin === baseOrigin && lu.pathname.startsWith(basePath) && !visited.has(clean)) {
-            queue.push(clean);
+          if (lu.origin === baseOrigin && lu.pathname.startsWith(basePath)) {
+            const normalizedLink = baseOrigin + decodePath(lu.pathname);
+            if (!visited.has(normalizedLink)) queue.push(link);
           }
         } catch {}
       }
