@@ -15,7 +15,7 @@ on:
       wait_ms:
         description: "Extra wait (ms) per page for JS to render (increase for slow sites)"
         required: false
-        default: "2000"
+        default: "4000"
         type: string
 
 permissions:
@@ -30,29 +30,24 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      # ── 1. Checkout repo ──────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Node.js setup ──────────────────────────────────────────────────
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      # ── 3. Install Chrome (מטפל בכל התלויות אוטומטית) ────────────────────
       - name: Setup Chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      # ── 4. Install npm packages ────────────────────────────────────────────
       - name: Install dependencies
         run: npm install
         env:
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: true
 
-      # ── 5. Run the crawler ────────────────────────────────────────────────
       - name: Crawl site
         env:
           SITE_URL: ${{ github.event.inputs.site_url || vars.SITE_URL }}
@@ -62,30 +57,46 @@ jobs:
           PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome-stable
         run: npm run crawl
 
-      # ── 6. Show summary ───────────────────────────────────────────────────
-      - name: Print output summary
+      # ── Debug: רואים בדיוק מה הורד ──────────────────────────────────────
+      - name: Debug output
+        if: always()
+        env:
+          SITE_URL: ${{ github.event.inputs.site_url || vars.SITE_URL }}
         run: |
-          echo "## Scraped files" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          find ./static-output -type f | head -100 >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "**Total files:** $(find ./static-output -type f | wc -l)" >> $GITHUB_STEP_SUMMARY
+          echo "=============================="
+          echo "SITE_URL = $SITE_URL"
+          echo "=============================="
+          echo "קבצים שנשמרו:"
+          find ./static-output -type f | sort || echo "תיקיית static-output ריקה או לא קיימת"
+          echo "=============================="
+          echo "האם index.html קיים?"
+          ls -la ./static-output/index.html 2>/dev/null || echo "❌ אין index.html בשורש!"
+          echo "=============================="
+          echo "50 שורות ראשונות של index.html:"
+          head -50 ./static-output/index.html 2>/dev/null || echo "אין קובץ"
 
-      # ── 7. Upload artifact (download as ZIP from Actions tab) ─────────────
+      - name: Print summary
+        if: always()
+        run: |
+          echo "## 📁 קבצים שהורדו" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          find ./static-output -type f | sort 2>/dev/null || echo "אין קבצים" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "**סה״כ:** $(find ./static-output -type f 2>/dev/null | wc -l) קבצים" >> $GITHUB_STEP_SUMMARY
+
       - name: Upload static site as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: static-site-${{ github.run_id }}
           path: ./static-output/
           retention-days: 30
 
-      # ── 8. Upload to GitHub Pages ─────────────────────────────────────────
       - name: Upload to GitHub Pages
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./static-output/
 
-  # ── 9. Deploy to GitHub Pages ─────────────────────────────────────────────
   deploy-pages:
     name: Deploy to GitHub Pages
     needs: scrape

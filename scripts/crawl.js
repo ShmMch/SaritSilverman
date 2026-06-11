@@ -8,7 +8,7 @@ const { URL } = require('url');
 const BASE_URL = process.env.SITE_URL.replace(/\/$/, '');
 const OUTPUT_DIR = process.env.OUTPUT_DIR || './output';
 const MAX_PAGES = parseInt(process.env.MAX_PAGES || '200');
-const WAIT_MS = parseInt(process.env.WAIT_MS || '2000');
+const WAIT_MS = parseInt(process.env.WAIT_MS || '4000'); // הוגדל ל-4 שניות
 
 if (!BASE_URL) {
   console.error('❌  SITE_URL environment variable is required');
@@ -17,7 +17,7 @@ if (!BASE_URL) {
 
 const baseUrl = new URL(BASE_URL);
 const baseOrigin = baseUrl.origin;
-const basePath = baseUrl.pathname; // e.g. /saritsilverman
+const basePath = baseUrl.pathname;
 
 const visited = new Set();
 const queue = [BASE_URL];
@@ -27,8 +27,6 @@ function decodePath(p) {
   try { return decodeURIComponent(p); } catch { return p; }
 }
 
-// Strip basePath prefix and normalize to a clean URL path (not filesystem path)
-// e.g. /saritsilverman/בית  →  /בית
 function toSitePath(urlPathname) {
   let p = decodePath(urlPathname);
   if (p.startsWith(basePath)) p = p.slice(basePath.length);
@@ -36,43 +34,26 @@ function toSitePath(urlPathname) {
   return p.startsWith('/') ? p : '/' + p;
 }
 
-// Convert site path to a local filename
-// /בית  →  /בית/index.html
-// /      →  /index.html
 function sitePathToFile(sitePath) {
   if (sitePath === '/') return '/index.html';
   if (!path.extname(sitePath)) return sitePath.replace(/\/$/, '') + '/index.html';
   return sitePath;
 }
 
-// Build a relative href from one page to another — pure URL logic, no filesystem paths
-// fromSitePath: /צור-קשר     targetSitePath: /בית
-// result: ../בית/index.html
 function relativeHref(fromSitePath, targetSitePath) {
   const fromFile = sitePathToFile(fromSitePath === '/' ? '/' : fromSitePath);
   const targetFile = sitePathToFile(targetSitePath);
-
-  // Split into segments
   const fromParts = fromFile.split('/').filter(Boolean);
   const targetParts = targetFile.split('/').filter(Boolean);
-
-  // Remove filename from fromParts (we want the directory)
   fromParts.pop();
-
-  // Find common prefix length
   let common = 0;
-  while (common < fromParts.length && common < targetParts.length && fromParts[common] === targetParts[common]) {
-    common++;
-  }
-
+  while (common < fromParts.length && common < targetParts.length && fromParts[common] === targetParts[common]) common++;
   const ups = fromParts.length - common;
   const downs = targetParts.slice(common);
-
   const rel = [...Array(ups).fill('..'), ...downs].join('/');
   return rel || './index.html';
 }
 
-// Convert a full URL to a local output file path
 function urlToFilePath(urlStr) {
   const u = new URL(urlStr);
   const sitePath = toSitePath(u.pathname);
@@ -105,7 +86,6 @@ function downloadFile(fileUrl, destPath) {
 
 function rewriteHtml(html, pageUrl) {
   const fromSitePath = toSitePath(new URL(pageUrl).pathname);
-
   return html.replace(
     /(href|src|action)="(https?:\/\/[^"]+)"/g,
     (match, attr, url) => {
@@ -122,19 +102,79 @@ function rewriteHtml(html, pageUrl) {
   );
 }
 
-async function extractAssets(page) {
+// המתן עד שרכיב ספציפי מופיע ב-DOM
+async function waitForContent(page) {
+  try {
+    // המתן שה-body יתמלא בתוכן אמיתי
+    await page.waitForFunction(() => {
+      const body = document.body.innerText.trim();
+      return body.length > 100;
+    }, { timeout: 10000 });
+  } catch {}
+
+  try {
+    // המתן שאין יותר בקשות רשת פעילות
+    await page.waitForNetworkIdle({ idleTime: 1500, timeout: 15000 });
+  } catch {}
+}
+
+// גלילה חכמה — גולל לאט ומחכה לכל lazy-load
+async function smartScroll(page) {
+  await page.evaluate(async () => {
+    await new Promise(resolve => {
+      const distance = 200;
+      const delay = 150;
+      let scrolled = 0;
+
+      const timer = setInterval(() => {
+        window.scrollBy(0, distance);
+        scrolled += distance;
+
+        if (scrolled >= document.body.scrollHeight) {
+          clearInterval(timer);
+          // גלול חזרה לראש ואז שוב לתחתית לוודא הכל נטען
+          window.scrollTo(0, 0);
+          setTimeout(() => {
+            window.scrollTo(0, document.body.scrollHeight);
+            setTimeout(resolve, 1000);
+          }, 500);
+        }
+      }, delay);
+    });
+  });
+}
+
+// חלץ את כל ה-inline styles עם background-image
+async function extractBackgroundImages(page) {
   return page.evaluate(() => {
+    const urls = [];
+    document.querySelectorAll('*').forEach(el => {
+      const style = window.getComputedStyle(el);
+      const bg = style.backgroundImage;
+      if (bg && bg !== 'none') {
+        const match = bg.match(/url\(["']?(https?:\/\/[^"')]+)/);
+        if (match) urls.push(match[1]);
+      }
+    });
+    return [...new Set(urls)];
+  });
+}
+
+async function extractAssets(page) {
+  const domAssets = await page.evaluate(() => {
     const assets = [];
-    document.querySelectorAll('img[src], script[src], link[href]').forEach(el => {
+    document.querySelectorAll('img[src], script[src], link[href], source[src], video[src]').forEach(el => {
       const url = el.src || el.href;
       if (url && url.startsWith('http')) assets.push(url);
     });
-    document.querySelectorAll('[style]').forEach(el => {
-      const m = el.style.backgroundImage.match(/url\(["']?(https?:\/\/[^"')]+)/);
-      if (m) assets.push(m[1]);
+    // data-src לתמונות עם lazy loading
+    document.querySelectorAll('[data-src]').forEach(el => {
+      if (el.dataset.src && el.dataset.src.startsWith('http')) assets.push(el.dataset.src);
     });
     return assets;
   });
+  const bgAssets = await extractBackgroundImages(page);
+  return [...new Set([...domAssets, ...bgAssets])];
 }
 
 async function extractLinks(page) {
@@ -162,16 +202,29 @@ async function crawl() {
   const browser = await puppeteer.launch({
     headless: 'new',
     executablePath,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-web-security',        // מונע חסימות CORS
+      '--disable-features=IsolateOrigins',
+      '--lang=he-IL'                   // עברית כשפת ממשק
+    ]
   });
 
   const page = await browser.newPage();
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1280, height: 900 });
 
+  // הגדר שפה עברית
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'he-IL,he;q=0.9,en;q=0.8' });
+
+  // אל תחסום כלום — Wix צריך את כל הבקשות
+  // רק מדיה כבדה נחסמת
   await page.setRequestInterception(true);
   page.on('request', req => {
-    if (['font', 'media'].includes(req.resourceType())) req.abort();
+    const type = req.resourceType();
+    if (type === 'media') req.abort();
     else req.continue();
   });
 
@@ -187,25 +240,25 @@ async function crawl() {
     pageCount++;
 
     const sitePath = toSitePath(u.pathname);
-    console.log(`[${pageCount}/${MAX_PAGES}] ${url}`);
+    console.log(`\n[${pageCount}/${MAX_PAGES}] ${url}`);
     console.log(`   sitePath: "${sitePath}"`);
 
     try {
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+      // טען את הדף
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+      // המתן לתוכן אמיתי
+      await waitForContent(page);
+
+      // גלול לאט לטעינת lazy content
+      await smartScroll(page);
+
+      // המתנה סופית לרכיבים אחרונים
       await new Promise(r => setTimeout(r, WAIT_MS));
 
-      await page.evaluate(async () => {
-        await new Promise(resolve => {
-          let total = 0;
-          const timer = setInterval(() => {
-            window.scrollBy(0, 300);
-            total += 300;
-            if (total >= document.body.scrollHeight) { clearInterval(timer); resolve(); }
-          }, 100);
-        });
-      });
-
       const html = await page.content();
+      console.log(`   HTML size: ${Math.round(html.length / 1024)}KB`);
+
       const rewritten = rewriteHtml(html, url);
       const filePath = urlToFilePath(url);
       ensureDir(filePath);
@@ -213,6 +266,7 @@ async function crawl() {
       console.log(`   ✅ → ${filePath}`);
 
       const assets = await extractAssets(page);
+      console.log(`   Assets found: ${assets.length}`);
       for (const assetUrl of assets) {
         try {
           const au = new URL(assetUrl);
@@ -225,6 +279,7 @@ async function crawl() {
       }
 
       const links = await extractLinks(page);
+      console.log(`   Links found: ${links.length}`);
       for (const link of links) {
         try {
           const lu = new URL(link);
