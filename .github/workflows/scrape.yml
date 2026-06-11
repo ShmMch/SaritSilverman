@@ -1,21 +1,20 @@
-name: Wix Static Site Scraper
+name: Wix Offline Site Builder
 
 on:
   workflow_dispatch:
     inputs:
       site_url:
-        description: "URL של האתר (e.g. https://myname.wixsite.com/mysite)"
+        description: "URL מלא של האתר (e.g. https://myname.wixsite.com/mysite)"
         required: true
         type: string
-      max_pages:
-        description: "מקסימום עמודים"
-        required: false
-        default: "200"
+      primary_folder:
+        description: "שם התיקייה אחרי wixsite.com (e.g. mysite)"
+        required: true
         type: string
-      wait_ms:
-        description: "המתנה per page בms (הגדל לאתרים איטיים)"
+      wait_seconds:
+        description: "שניות המתנה בין דפים (3-6 לאתרים עמוסים)"
         required: false
-        default: "4000"
+        default: "4"
         type: string
 
 permissions:
@@ -23,7 +22,7 @@ permissions:
 
 jobs:
   scrape:
-    name: Crawl & Save Offline Site
+    name: Build Offline Site
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -31,43 +30,52 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+      - name: Install Python & dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3 python3-pip chromium-browser
+          pip3 install selenium requests beautifulsoup4 --break-system-packages
 
-      - name: Setup Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
+      - name: Download WixScraper
+        run: |
+          curl -o wixscraper.py https://raw.githubusercontent.com/ryanhlewis/WixScraper/main/wixscraper.py
 
-      - name: Install dependencies
-        run: npm install
-        env:
-          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: true
+      - name: Build config.json
+        run: |
+          SITE="${{ github.event.inputs.site_url }}"
+          FOLDER="${{ github.event.inputs.primary_folder }}"
+          WAIT="${{ github.event.inputs.wait_seconds }}"
+          cat > config.json << CONF
+          {
+            "site": "$SITE",
+            "blockPrimaryFolder": "$FOLDER",
+            "wait": $WAIT,
+            "recursive": "True",
+            "darkWebsite": "False",
+            "forceDownloadAgain": "False",
+            "metatags": {},
+            "mapData": {}
+          }
+          CONF
+          echo "Config:"
+          cat config.json
 
-      - name: Crawl site
-        env:
-          SITE_URL: ${{ github.event.inputs.site_url || vars.SITE_URL }}
-          OUTPUT_DIR: ./static-output
-          MAX_PAGES: ${{ github.event.inputs.max_pages || '200' }}
-          WAIT_MS: ${{ github.event.inputs.wait_ms || '4000' }}
-          PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome-stable
-        run: npm run crawl
+      - name: Run WixScraper
+        run: python3 wixscraper.py
 
       - name: Show results
         if: always()
         run: |
           echo "## קבצים שנשמרו" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          find ./static-output -type f -name "*.html" | sort >> $GITHUB_STEP_SUMMARY
+          find . -not -path './.git/*' -not -name 'wixscraper.py' -not -name 'config.json' -type f | grep -v node_modules | sort >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "**סה״כ:** $(find ./static-output -type f 2>/dev/null | wc -l) קבצים" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload ZIP
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: offline-site-${{ github.run_id }}
-          path: ./static-output/
+          path: |
+            ./${{ github.event.inputs.primary_folder }}/
           retention-days: 30
