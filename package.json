@@ -1,11 +1,12 @@
 {
   "name": "wix-static-scraper",
   "version": "1.0.0",
-  "description": "Crawl a Wix site and save it as a static site",
+  "description": "Crawl a Wix site and save it as a static offline site",
   "scripts": {
     "crawl": "node scripts/crawl.js"
   },
   "dependencies": {
-    "puppeteer": "^24.15.0"
+    "puppeteer": "^24.15.0",
+    "single-file-cli": "^1.0.85"
   }
 }

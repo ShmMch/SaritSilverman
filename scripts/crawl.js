@@ -1,31 +1,23 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const http = require('http');
 const { URL } = require('url');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(exec);
 
 const BASE_URL = process.env.SITE_URL.replace(/\/$/, '');
 const OUTPUT_DIR = process.env.OUTPUT_DIR || './output';
 const MAX_PAGES = parseInt(process.env.MAX_PAGES || '200');
-const WAIT_MS = parseInt(process.env.WAIT_MS || '4000'); // הוגדל ל-4 שניות
+const WAIT_MS = parseInt(process.env.WAIT_MS || '4000');
 
-if (!BASE_URL) {
-  console.error('❌  SITE_URL environment variable is required');
-  process.exit(1);
-}
+if (!BASE_URL) { console.error('❌ SITE_URL required'); process.exit(1); }
 
 const baseUrl = new URL(BASE_URL);
 const baseOrigin = baseUrl.origin;
 const basePath = baseUrl.pathname;
 
-const visited = new Set();
-const queue = [BASE_URL];
-let pageCount = 0;
-
-function decodePath(p) {
-  try { return decodeURIComponent(p); } catch { return p; }
-}
+function decodePath(p) { try { return decodeURIComponent(p); } catch { return p; } }
 
 function toSitePath(urlPathname) {
   let p = decodePath(urlPathname);
@@ -34,32 +26,43 @@ function toSitePath(urlPathname) {
   return p.startsWith('/') ? p : '/' + p;
 }
 
-function sitePathToFile(sitePath) {
-  if (sitePath === '/') return '/index.html';
-  if (!path.extname(sitePath)) return sitePath.replace(/\/$/, '') + '/index.html';
-  return sitePath;
-}
-
-function relativeHref(fromSitePath, targetSitePath) {
-  const fromFile = sitePathToFile(fromSitePath === '/' ? '/' : fromSitePath);
-  const targetFile = sitePathToFile(targetSitePath);
-  const fromParts = fromFile.split('/').filter(Boolean);
-  const targetParts = targetFile.split('/').filter(Boolean);
-  fromParts.pop();
-  let common = 0;
-  while (common < fromParts.length && common < targetParts.length && fromParts[common] === targetParts[common]) common++;
-  const ups = fromParts.length - common;
-  const downs = targetParts.slice(common);
-  const rel = [...Array(ups).fill('..'), ...downs].join('/');
-  return rel || './index.html';
-}
-
-function urlToFilePath(urlStr) {
+function urlToFileName(urlStr) {
   const u = new URL(urlStr);
-  const sitePath = toSitePath(u.pathname);
-  const filePart = sitePathToFile(sitePath);
-  const safe = filePart.replace(/[?#]/g, '_');
-  return path.join(OUTPUT_DIR, safe);
+  let sitePath = toSitePath(u.pathname);
+  if (sitePath === '/') return 'index.html';
+  // e.g. /צור-קשר → צור-קשר.html
+  const clean = sitePath.replace(/^\//, '').replace(/\//g, '_').replace(/[?#]/g, '_');
+  return clean + '.html';
+}
+
+// בנה index.html שמקשר לכל הדפים
+function buildIndex(pages) {
+  const links = pages.map(({ url, fileName, title }) => {
+    const label = title || decodePath(new URL(url).pathname.replace(basePath, '') || '/');
+    return `<li><a href="${fileName}">${label}</a></li>`;
+  }).join('\n');
+
+  return `<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+  <meta charset="UTF-8">
+  <title>ניווט — ${BASE_URL}</title>
+  <style>
+    body { font-family: sans-serif; direction: rtl; padding: 40px; max-width: 600px; margin: auto; }
+    h1 { font-size: 20px; margin-bottom: 20px; }
+    ul { list-style: none; padding: 0; }
+    li { margin: 10px 0; }
+    a { color: #0066cc; text-decoration: none; font-size: 16px; }
+    a:hover { text-decoration: underline; }
+    p { color: #888; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>עמודי האתר</h1>
+  <p>גרסה לוקלית של <a href="${BASE_URL}" target="_blank">${BASE_URL}</a></p>
+  <ul>${links}</ul>
+</body>
+</html>`;
 }
 
 function ensureDir(filePath) {
@@ -67,168 +70,115 @@ function ensureDir(filePath) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function downloadFile(fileUrl, destPath) {
-  return new Promise((resolve) => {
-    if (fs.existsSync(destPath)) return resolve();
-    ensureDir(destPath);
-    const proto = fileUrl.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(destPath);
-    proto.get(fileUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        file.close();
-        return downloadFile(res.headers.location, destPath).then(resolve);
-      }
-      res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(); });
-    }).on('error', () => { file.close(); resolve(); });
-  });
+function normalizeUrl(urlStr) {
+  try { const u = new URL(urlStr); return baseOrigin + decodePath(u.pathname); } catch { return urlStr; }
 }
 
-function rewriteHtml(html, pageUrl) {
-  const fromSitePath = toSitePath(new URL(pageUrl).pathname);
-  return html.replace(
-    /(href|src|action)="(https?:\/\/[^"]+)"/g,
-    (match, attr, url) => {
-      try {
-        const u = new URL(url);
-        if (u.origin === baseOrigin && u.pathname.startsWith(basePath)) {
-          const targetSitePath = toSitePath(u.pathname);
-          const rel = relativeHref(fromSitePath, targetSitePath);
-          return `${attr}="${rel}"`;
-        }
-      } catch {}
-      return match;
-    }
-  );
-}
-
-// המתן עד שרכיב ספציפי מופיע ב-DOM
 async function waitForContent(page) {
-  try {
-    // המתן שה-body יתמלא בתוכן אמיתי
-    await page.waitForFunction(() => {
-      const body = document.body.innerText.trim();
-      return body.length > 100;
-    }, { timeout: 10000 });
-  } catch {}
-
-  try {
-    // המתן שאין יותר בקשות רשת פעילות
-    await page.waitForNetworkIdle({ idleTime: 1500, timeout: 15000 });
-  } catch {}
+  try { await page.waitForFunction(() => document.body.innerText.trim().length > 100, { timeout: 10000 }); } catch {}
+  try { await page.waitForNetworkIdle({ idleTime: 1500, timeout: 15000 }); } catch {}
 }
 
-// גלילה חכמה — גולל לאט ומחכה לכל lazy-load
 async function smartScroll(page) {
   await page.evaluate(async () => {
     await new Promise(resolve => {
-      const distance = 200;
-      const delay = 150;
       let scrolled = 0;
-
       const timer = setInterval(() => {
-        window.scrollBy(0, distance);
-        scrolled += distance;
-
+        window.scrollBy(0, 200);
+        scrolled += 200;
         if (scrolled >= document.body.scrollHeight) {
           clearInterval(timer);
-          // גלול חזרה לראש ואז שוב לתחתית לוודא הכל נטען
           window.scrollTo(0, 0);
-          setTimeout(() => {
-            window.scrollTo(0, document.body.scrollHeight);
-            setTimeout(resolve, 1000);
-          }, 500);
+          setTimeout(() => { window.scrollTo(0, document.body.scrollHeight); setTimeout(resolve, 1000); }, 500);
         }
-      }, delay);
+      }, 150);
     });
   });
-}
-
-// חלץ את כל ה-inline styles עם background-image
-async function extractBackgroundImages(page) {
-  return page.evaluate(() => {
-    const urls = [];
-    document.querySelectorAll('*').forEach(el => {
-      const style = window.getComputedStyle(el);
-      const bg = style.backgroundImage;
-      if (bg && bg !== 'none') {
-        const match = bg.match(/url\(["']?(https?:\/\/[^"')]+)/);
-        if (match) urls.push(match[1]);
-      }
-    });
-    return [...new Set(urls)];
-  });
-}
-
-async function extractAssets(page) {
-  const domAssets = await page.evaluate(() => {
-    const assets = [];
-    document.querySelectorAll('img[src], script[src], link[href], source[src], video[src]').forEach(el => {
-      const url = el.src || el.href;
-      if (url && url.startsWith('http')) assets.push(url);
-    });
-    // data-src לתמונות עם lazy loading
-    document.querySelectorAll('[data-src]').forEach(el => {
-      if (el.dataset.src && el.dataset.src.startsWith('http')) assets.push(el.dataset.src);
-    });
-    return assets;
-  });
-  const bgAssets = await extractBackgroundImages(page);
-  return [...new Set([...domAssets, ...bgAssets])];
 }
 
 async function extractLinks(page) {
   return page.evaluate(() =>
-    Array.from(document.querySelectorAll('a[href]'))
-      .map(a => a.href)
-      .filter(h => h.startsWith('http'))
+    Array.from(document.querySelectorAll('a[href]')).map(a => a.href).filter(h => h.startsWith('http'))
   );
 }
 
-function normalizeUrl(urlStr) {
+async function saveSingleFile(pageUrl, outputPath, chromePath) {
+  // SingleFile CLI — שומר הכל inline בקובץ HTML אחד
+  // קישורים חיצוניים נשארים כפי שהם
+  const cmd = [
+    'npx single-file',
+    `"${pageUrl}"`,
+    `"${outputPath}"`,
+    `--browser-executable-path="${chromePath}"`,
+    '--browser-args=["--no-sandbox","--disable-setuid-sandbox"]',
+    '--dump-content=false',
+    '--compress-HTML=false',
+    '--remove-hidden-elements=false',
+    '--remove-unused-styles=false',
+    '--remove-scripts=false',        // שמור JS לאנימציות
+    `--browser-wait-until=networkidle2`,
+    `--browser-wait-delay=${WAIT_MS}`,
+  ].join(' ');
+
   try {
-    const u = new URL(urlStr);
-    return baseOrigin + decodePath(u.pathname);
-  } catch { return urlStr; }
+    const { stdout, stderr } = await execAsync(cmd, { timeout: 60000 });
+    if (stderr && !stderr.includes('warn')) console.log(`   SingleFile: ${stderr.trim()}`);
+    return true;
+  } catch (err) {
+    console.log(`   ⚠️ SingleFile failed: ${err.message}`);
+    return false;
+  }
+}
+
+async function rewriteInternalLinks(filePath, allPages, currentFileName) {
+  let html = fs.readFileSync(filePath, 'utf8');
+  let changed = false;
+
+  for (const { url, fileName } of allPages) {
+    // החלף קישורים פנימיים לקבצים המקומיים
+    const escapedUrl = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const decodedUrl = decodePath(url).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    [escapedUrl, decodedUrl].forEach(pattern => {
+      const regex = new RegExp(`href="${pattern}[^"]*"`, 'g');
+      if (regex.test(html)) {
+        html = html.replace(regex, `href="${fileName}"`);
+        changed = true;
+      }
+    });
+  }
+
+  if (changed) fs.writeFileSync(filePath, html, 'utf8');
 }
 
 async function crawl() {
-  console.log(`🚀 Starting crawl of ${BASE_URL}`);
-  console.log(`📁 Output: ${OUTPUT_DIR}  |  Base path: "${basePath}"  |  Max pages: ${MAX_PAGES}\n`);
+  console.log(`🚀 Crawling: ${BASE_URL}`);
+  console.log(`📁 Output: ${OUTPUT_DIR} | Max: ${MAX_PAGES}\n`);
 
-  if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  ensureDir(OUTPUT_DIR + '/placeholder');
 
+  const chromePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable';
+
+  // שלב 1 — גלה את כל הדפים עם Puppeteer
+  console.log('🔍 Phase 1: Discovering all pages...\n');
   const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
   const browser = await puppeteer.launch({
-    headless: 'new',
-    executablePath,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-web-security',        // מונע חסימות CORS
-      '--disable-features=IsolateOrigins',
-      '--lang=he-IL'                   // עברית כשפת ממשק
-    ]
+    headless: 'new', executablePath,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--lang=he-IL']
   });
 
   const page = await browser.newPage();
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1280, height: 900 });
-
-  // הגדר שפה עברית
-  await page.setExtraHTTPHeaders({ 'Accept-Language': 'he-IL,he;q=0.9,en;q=0.8' });
-
-  // אל תחסום כלום — Wix צריך את כל הבקשות
-  // רק מדיה כבדה נחסמת
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'he-IL,he;q=0.9' });
   await page.setRequestInterception(true);
-  page.on('request', req => {
-    const type = req.resourceType();
-    if (type === 'media') req.abort();
-    else req.continue();
-  });
+  page.on('request', req => { if (req.resourceType() === 'media') req.abort(); else req.continue(); });
 
-  while (queue.length > 0 && pageCount < MAX_PAGES) {
+  const visited = new Set();
+  const queue = [BASE_URL];
+  const allPages = []; // { url, fileName, title }
+
+  while (queue.length > 0 && allPages.length < MAX_PAGES) {
     const url = queue.shift();
     const normalized = normalizeUrl(url);
     if (visited.has(normalized)) continue;
@@ -237,76 +187,60 @@ async function crawl() {
     if (u.origin !== baseOrigin || !u.pathname.startsWith(basePath)) continue;
 
     visited.add(normalized);
-    pageCount++;
-
-    const sitePath = toSitePath(u.pathname);
-    console.log(`\n[${pageCount}/${MAX_PAGES}] ${url}`);
-    console.log(`   sitePath: "${sitePath}"`);
+    const fileName = urlToFileName(url);
+    console.log(`[${allPages.length + 1}] Discovered: ${url} → ${fileName}`);
 
     try {
-      // טען את הדף
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-      // המתן לתוכן אמיתי
       await waitForContent(page);
-
-      // גלול לאט לטעינת lazy content
       await smartScroll(page);
+      await new Promise(r => setTimeout(r, 1000));
 
-      // המתנה סופית לרכיבים אחרונים
-      await new Promise(r => setTimeout(r, WAIT_MS));
-
-      const html = await page.content();
-      console.log(`   HTML size: ${Math.round(html.length / 1024)}KB`);
-
-      const rewritten = rewriteHtml(html, url);
-      const filePath = urlToFilePath(url);
-      ensureDir(filePath);
-      fs.writeFileSync(filePath, rewritten, 'utf8');
-      console.log(`   ✅ → ${filePath}`);
-
-      const assets = await extractAssets(page);
-      console.log(`   Assets found: ${assets.length}`);
-      for (const assetUrl of assets) {
-        try {
-          const au = new URL(assetUrl);
-          if (au.origin === baseOrigin) {
-            const assetSitePath = toSitePath(au.pathname);
-            const destPath = path.join(OUTPUT_DIR, assetSitePath);
-            await downloadFile(assetUrl, destPath);
-          }
-        } catch {}
-      }
+      const title = await page.title();
+      allPages.push({ url, fileName, title });
 
       const links = await extractLinks(page);
-      console.log(`   Links found: ${links.length}`);
       for (const link of links) {
         try {
           const lu = new URL(link);
           if (lu.origin === baseOrigin && lu.pathname.startsWith(basePath)) {
-            const normLink = normalizeUrl(link);
-            if (!visited.has(normLink)) queue.push(link);
+            if (!visited.has(normalizeUrl(link))) queue.push(link);
           }
         } catch {}
       }
-
     } catch (err) {
-      console.log(`   ⚠️  Failed: ${err.message}`);
+      console.log(`   ⚠️ ${err.message}`);
     }
   }
 
   await browser.close();
+  console.log(`\n✅ Found ${allPages.length} pages\n`);
 
-  const sitemap = [...visited].map(u => `<url><loc>${u}</loc></url>`).join('\n');
-  fs.writeFileSync(
-    path.join(OUTPUT_DIR, 'sitemap.xml'),
-    `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${sitemap}\n</urlset>`
-  );
+  // שלב 2 — שמור כל דף עם SingleFile
+  console.log('💾 Phase 2: Saving pages with SingleFile...\n');
+  for (let i = 0; i < allPages.length; i++) {
+    const { url, fileName } = allPages[i];
+    const outputPath = path.join(OUTPUT_DIR, fileName);
+    console.log(`[${i + 1}/${allPages.length}] Saving: ${url}`);
+    await saveSingleFile(url, outputPath, chromePath);
+  }
 
-  console.log(`\n✅ Done! ${pageCount} pages saved to ${OUTPUT_DIR}/`);
+  // שלב 3 — שכתב קישורים פנימיים
+  console.log('\n🔗 Phase 3: Rewriting internal links...\n');
+  for (const { fileName } of allPages) {
+    const filePath = path.join(OUTPUT_DIR, fileName);
+    if (fs.existsSync(filePath)) {
+      await rewriteInternalLinks(filePath, allPages, fileName);
+      console.log(`   ✅ ${fileName}`);
+    }
+  }
+
+  // שלב 4 — צור index
+  const indexPath = path.join(OUTPUT_DIR, '_index.html');
+  fs.writeFileSync(indexPath, buildIndex(allPages), 'utf8');
+  console.log(`\n📋 Index → ${indexPath}`);
+  console.log(`✅ Done! ${allPages.length} pages saved to ${OUTPUT_DIR}/`);
+  console.log(`\n👉 פתחי את _index.html כדי לנווט באתר`);
 }
 
-crawl().catch(err => {
-  console.error('Fatal:', err);
-  process.exit(1);
-});
+crawl().catch(err => { console.error('Fatal:', err); process.exit(1); });
